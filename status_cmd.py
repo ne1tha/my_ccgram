@@ -48,7 +48,7 @@ def _list_tmux_windows(session_name: str) -> list[dict[str, str]]:
         if result.returncode != 0:
             return []
         windows = []
-        for line in result.stdout.strip().splitlines():
+        for line in result.stdout.splitlines():
             parts = line.split("\t", 1)
             if len(parts) == _TMUX_FORMAT_PARTS:
                 windows.append({"id": parts[0], "name": parts[1]})
