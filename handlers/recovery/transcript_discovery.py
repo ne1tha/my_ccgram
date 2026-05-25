@@ -62,6 +62,10 @@ async def _detect_and_apply_provider(
 
     if detected and detected != state.provider_name:
         old_provider = state.provider_name
+        if detected == "shell" and _should_keep_existing_agent_provider(state):
+            state.transcript_path = ""
+            await tmux_manager.cleanup_shell_prompt_marker(window_id)
+            return
         session_manager.set_window_provider(window_id, detected, cwd=w.cwd or None)
         # Lazy: providers/__init__.py reaches back into transcript code
         # via provider format modules.
@@ -133,6 +137,14 @@ def _resolve_providers_to_try(
         for name in registry.provider_names()
         if not registry.get(name).capabilities.supports_hook and name != "shell"
     ]
+
+
+def _should_keep_existing_agent_provider(state: "WindowState") -> bool:
+    """Keep an explicit agent provider while its pane is temporarily at a shell."""
+    if not state.provider_name:
+        return False
+    provider = get_provider_for_window("", state.provider_name)
+    return provider.capabilities.supports_mailbox_delivery
 
 
 async def _find_and_register_transcript(
@@ -230,6 +242,10 @@ async def discover_and_register_transcript(
 
     providers_to_try = _resolve_providers_to_try(window_id, state, w)
     if providers_to_try is None:
+        if _should_keep_existing_agent_provider(state):
+            state.transcript_path = ""
+            await tmux_manager.cleanup_shell_prompt_marker(window_id)
+            return
         session_manager.set_window_provider(window_id, "shell")
         state.transcript_path = ""
         # Lazy: same shell ↔ recovery cycle as _detect_and_apply_provider.

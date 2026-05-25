@@ -12,11 +12,22 @@ provider chains; only the invoked subcommand pays its import cost.
 """
 
 import os
+import re
+import subprocess
 from pathlib import Path
 
 import click
 
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+_DEFAULT_IMPORT_ENV_NAMES = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_ORGANIZATION",
+    "CODEX_API_KEY",
+    "CODEX_BASE_URL",
+)
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _validate_positive_float(
@@ -253,6 +264,79 @@ def status_cmd() -> None:
     from .status_cmd import status_main
 
     status_main()
+
+
+# --- import-env command ---------------------------------------------------
+
+
+def _tmux_quote(value: str) -> str:
+    """Single-quote *value* for a tmux source-file command."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+@cli.command("import-env")
+@click.argument("names", nargs=-1)
+@click.option(
+    "--tmux-session",
+    default=None,
+    envvar="TMUX_SESSION_NAME",
+    help="Tmux session name (default: ccgram).",
+)
+@click.option(
+    "--unset-missing",
+    is_flag=True,
+    help="Unset variables that are not present in the current shell.",
+)
+def import_env_cmd(
+    names: tuple[str, ...], tmux_session: str | None, unset_missing: bool
+) -> None:
+    """Import current-shell API env vars into ccgram's tmux session."""
+    session = tmux_session or os.environ.get("TMUX_SESSION_NAME", "ccgram")
+    selected = names or _DEFAULT_IMPORT_ENV_NAMES
+
+    commands: list[str] = []
+    imported: list[str] = []
+    unset: list[str] = []
+    missing: list[str] = []
+    for name in selected:
+        if not name:
+            continue
+        if not _ENV_NAME_RE.match(name):
+            raise click.BadParameter(f"invalid environment variable name: {name}")
+        if name in os.environ:
+            commands.append(
+                f"set-environment -t {_tmux_quote(session)} {name} "
+                f"{_tmux_quote(os.environ[name])}"
+            )
+            imported.append(name)
+        elif unset_missing:
+            commands.append(f"set-environment -t {_tmux_quote(session)} -u {name}")
+            unset.append(name)
+        else:
+            missing.append(name)
+
+    if not commands:
+        click.echo("No environment variables imported.")
+        if missing:
+            click.echo(f"Missing in current shell: {', '.join(missing)}")
+        return
+
+    proc = subprocess.run(
+        ["tmux", "source-file", "-"],
+        input="\n".join(commands) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise click.ClickException(proc.stderr.strip() or "tmux source-file failed")
+
+    if imported:
+        click.echo(f"Imported into tmux session {session}: {', '.join(imported)}")
+    if unset:
+        click.echo(f"Unset in tmux session {session}: {', '.join(unset)}")
+    if missing:
+        click.echo(f"Skipped missing vars: {', '.join(missing)}")
 
 
 # --- doctor command --------------------------------------------------------

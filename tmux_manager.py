@@ -49,6 +49,9 @@ _VIM_PROBE_DELAY = 0.12
 
 
 _VIM_INSERT_RE = re.compile(r"^--\s*INSERT\s*--\s*$")
+_KNOWN_SHELLS = frozenset(
+    {"bash", "zsh", "fish", "sh", "dash", "tcsh", "csh", "ksh"}
+)
 
 
 def has_insert_indicator(pane_text: str) -> bool:
@@ -66,6 +69,14 @@ def has_insert_indicator(pane_text: str) -> bool:
 def notify_vim_insert_seen(window_id: str) -> None:
     """Record that vim INSERT mode was observed (called from status polling)."""
     _vim_state[window_id] = True
+
+
+def _is_shell_command(command: str) -> bool:
+    """Return True when tmux reports an interactive shell as foreground command."""
+    if not command:
+        return False
+    basename = Path(command.split()[0]).name.lstrip("-")
+    return basename in _KNOWN_SHELLS
 
 
 @topic_state.register("window")
@@ -681,6 +692,12 @@ class TmuxManager:
 
     async def _send_literal_then_enter_locked(self, window_id: str, text: str) -> bool:
         """Inner send implementation (must be called under per-window lock)."""
+        window = await self.find_window_by_id(window_id)
+        if window and _is_shell_command(window.pane_current_command):
+            return await asyncio.to_thread(
+                self._pane_send, window_id, text, enter=True, literal=True
+            )
+
         await self._ensure_vim_insert_mode(window_id)
 
         if text.startswith("!"):
@@ -703,6 +720,26 @@ class TmuxManager:
         await asyncio.sleep(0.5)
         return await asyncio.to_thread(
             self._pane_send, window_id, "", enter=True, literal=False
+        )
+
+    async def cleanup_shell_prompt_marker(self, window_id: str) -> bool:
+        """Remove ccgram's shell prompt marker from an interactive shell pane."""
+        window = await self.find_window_by_id(window_id)
+        if not window or not _is_shell_command(window.pane_current_command):
+            return False
+
+        cmd = (
+            "case \"${PROMPT_COMMAND-}\" in "
+            "__ccgram_sc) PROMPT_COMMAND=;; "
+            "__ccgram_sc';'*) PROMPT_COMMAND=${PROMPT_COMMAND#__ccgram_sc;};; "
+            "esac; "
+            "PS1=${PS1//$'\\\\[\\\\033[2m\\\\]⌘${__ccgram_x}⌘\\\\[\\\\033[0m\\\\] '/}; "
+            "unset -f __ccgram_sc 2>/dev/null; "
+            "unset __ccgram_x; "
+            "clear"
+        )
+        return await asyncio.to_thread(
+            self._pane_send, window_id, cmd, enter=True, literal=True
         )
 
     async def send_keys(
