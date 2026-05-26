@@ -152,6 +152,45 @@ class LaunchDefaultsTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_other_topic_message_does_not_clear_pending_directory_browser(self):
+        import asyncio
+        import importlib
+        from unittest.mock import AsyncMock, patch
+
+        text_handler = importlib.import_module("ccgram.handlers.text.text_handler")
+        directory_browser = importlib.import_module(
+            "ccgram.handlers.topics.directory_browser"
+        )
+        user_state = importlib.import_module("ccgram.handlers.user_state")
+
+        user_data = {
+            directory_browser.STATE_KEY: directory_browser.STATE_BROWSING_DIRECTORY,
+            directory_browser.BROWSE_PATH_KEY: "/mnt/nvme",
+            directory_browser.BROWSE_PAGE_KEY: 0,
+            directory_browser.BROWSE_DIRS_KEY: [],
+            user_state.PENDING_THREAD_ID: 243,
+            user_state.PENDING_THREAD_TEXT: "在么",
+        }
+        message = object()
+
+        async def run():
+            with patch.object(text_handler, "safe_reply", new=AsyncMock()) as reply_mock:
+                handled = await text_handler._check_ui_guards(
+                    user_data, 208, message
+                )
+                self.assertFalse(handled)
+                reply_mock.assert_not_awaited()
+
+        asyncio.run(run())
+        self.assertEqual(user_data.get(user_state.PENDING_THREAD_ID), 243)
+        self.assertEqual(user_data.get(user_state.PENDING_THREAD_TEXT), "在么")
+        self.assertEqual(
+            user_data.get(directory_browser.STATE_KEY),
+            directory_browser.STATE_BROWSING_DIRECTORY,
+        )
+        self.assertEqual(user_data.get(directory_browser.BROWSE_PATH_KEY), "/mnt/nvme")
+
+
     def test_live_shell_pane_overrides_stale_codex_state(self):
         import asyncio
         import importlib

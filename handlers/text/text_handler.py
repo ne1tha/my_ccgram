@@ -31,8 +31,6 @@ from ..topics.directory_browser import (
     build_directory_browser,
     build_window_picker,
     resolve_default_workdir,
-    clear_browse_state,
-    clear_window_picker_state,
 )
 from ..interactive import get_interactive_window, handle_interactive_ui
 from ..messaging_pipeline.message_queue import enqueue_status_update
@@ -164,10 +162,9 @@ async def _check_ui_guards(
                 "Please use the window picker above, or tap Cancel.",
             )
             return True
-        # Stale picker state from a different thread — clear it
-        clear_window_picker_state(user_data)
-        user_data.pop(PENDING_THREAD_ID, None)
-        user_data.pop(PENDING_THREAD_TEXT, None)
+        # Preserve another topic's pending picker. context.user_data is per-user,
+        # not per-topic; clearing here races with normal traffic in bound topics
+        # and makes later callbacks create unbound tmux windows/topics.
 
     # Directory browser guard
     if user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY:
@@ -178,10 +175,8 @@ async def _check_ui_guards(
                 "Please use the directory browser above, or tap Cancel.",
             )
             return True
-        # Stale browsing state from a different thread — clear it
-        clear_browse_state(user_data)
-        user_data.pop(PENDING_THREAD_ID, None)
-        user_data.pop(PENDING_THREAD_TEXT, None)
+        # Preserve another topic's pending browser for the same reason. A new
+        # unbound-topic flow may intentionally overwrite the browse state later.
 
     return False
 
