@@ -50,6 +50,7 @@ from .directory_browser import (
     BROWSE_PATH_KEY,
     build_directory_browser,
     build_mode_picker,
+    resolve_default_workdir,
     build_provider_picker,
     clear_browse_state,
     get_favorites,
@@ -170,7 +171,7 @@ async def _handle_star(
     now_starred = user_preferences.toggle_user_star(user_id, fav_path)
 
     # Rebuild browser at current path to update star icons
-    default_path = str(Path.cwd())
+    default_path = resolve_default_workdir()
     current_path = (
         context.user_data.get(BROWSE_PATH_KEY, default_path)
         if context.user_data
@@ -214,7 +215,7 @@ async def _handle_select(
         return
     subdir_name = cached_dirs[idx]
 
-    default_path = str(Path.cwd())
+    default_path = resolve_default_workdir()
     current_path = (
         context.user_data.get(BROWSE_PATH_KEY, default_path)
         if context.user_data
@@ -251,7 +252,7 @@ async def _handle_up(
     if pending_tid is not None and get_thread_id(update) != pending_tid:
         await query.answer("Stale browser (topic mismatch)", show_alert=True)
         return
-    default_path = str(Path.cwd())
+    default_path = resolve_default_workdir()
     current_path = (
         context.user_data.get(BROWSE_PATH_KEY, default_path)
         if context.user_data
@@ -317,7 +318,7 @@ async def _handle_page(
     except ValueError:
         await query.answer("Invalid data")
         return
-    default_path = str(Path.cwd())
+    default_path = resolve_default_workdir()
     current_path = (
         context.user_data.get(BROWSE_PATH_KEY, default_path)
         if context.user_data
@@ -342,7 +343,7 @@ async def _handle_confirm(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Handle CB_DIR_CONFIRM: confirm directory, show provider picker."""
-    default_path = str(Path.cwd())
+    default_path = resolve_default_workdir()
     selected_path = (
         context.user_data.get(BROWSE_PATH_KEY, default_path)
         if context.user_data
@@ -441,7 +442,7 @@ async def _handle_provider_select(
         await query.answer("Unknown provider", show_alert=True)
         return
 
-    default_path = str(Path.cwd())
+    default_path = resolve_default_workdir()
     selected_path = (
         context.user_data.get(BROWSE_PATH_KEY, default_path)
         if context.user_data
@@ -694,7 +695,7 @@ async def _handle_mode_select(
         await query.answer("Unknown mode", show_alert=True)
         return
 
-    default_path = str(Path.cwd())
+    default_path = resolve_default_workdir()
     selected_path = (
         context.user_data.get(BROWSE_PATH_KEY, default_path)
         if context.user_data

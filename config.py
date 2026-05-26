@@ -142,6 +142,13 @@ class Config:
             "CCGRAM_PROVIDER", "CCBOT_PROVIDER", "claude"
         )
 
+        # Default working directory for new sessions. Systemd sets the ccgram
+        # service cwd to /mnt/nvme on this server; keep an env override for
+        # portability and tests.
+        self.default_workdir: str = os.getenv("CCGRAM_DEFAULT_WORKDIR") or str(
+            Path.cwd()
+        )
+
         # Directory browser: show hidden (dot) directories
         self.show_hidden_dirs: bool = _env_with_fallback(
             "CCGRAM_SHOW_HIDDEN_DIRS", "CCBOT_SHOW_HIDDEN_DIRS"

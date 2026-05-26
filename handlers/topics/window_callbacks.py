@@ -12,8 +12,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 import structlog
-from pathlib import Path
-
 from telegram import CallbackQuery, Chat, Update
 from telegram.error import TelegramError
 from ... import window_query
@@ -32,6 +30,7 @@ from .directory_browser import (
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
     clear_window_picker_state,
+    resolve_default_workdir,
 )
 from ..callback_registry import register
 from ..messaging_pipeline.message_sender import safe_edit, safe_send
@@ -149,24 +148,33 @@ async def _forward_pending_text(
 
     provider = get_provider_for_window(window_id, provider_name)
     is_chat_first = bool(provider and provider.capabilities.chat_first_command_path)
-    if is_chat_first and not is_existing_window:
+    if is_chat_first:
+        if is_existing_window:
+            await safe_send(
+                client,
+                thread_router.resolve_chat_id(user_id, thread_id),
+                "⚠️ Bound to an existing shell window. "
+                "Your first message was not executed. "
+                "Send `! <command>` to run a shell command.",
+                message_thread_id=thread_id,
+            )
+            return
         # Lazy: shell ↔ topics cycle.
         from ..shell.shell_commands import handle_shell_message
 
         await handle_shell_message(client, user_id, thread_id, window_id, text)
-    else:
-        # For non-shell providers or existing shell windows, send raw text.
-        # Existing shell windows skip handle_shell_message to avoid
-        # _ensure_prompt_marker racing with the offer keyboard just shown.
-        send_ok, send_msg = await send_to_window(window_id, text)
-        if not send_ok:
-            logger.warning("Failed to forward pending text: %s", send_msg)
-            await safe_send(
-                client,
-                thread_router.resolve_chat_id(user_id, thread_id),
-                f"❌ Failed to send pending message: {send_msg}",
-                message_thread_id=thread_id,
-            )
+        return
+
+    # Non-shell providers receive the pending text as chat input.
+    send_ok, send_msg = await send_to_window(window_id, text)
+    if not send_ok:
+        logger.warning("Failed to forward pending text: %s", send_msg)
+        await safe_send(
+            client,
+            thread_router.resolve_chat_id(user_id, thread_id),
+            f"❌ Failed to send pending message: {send_msg}",
+            message_thread_id=thread_id,
+        )
 
 
 async def _handle_bind(
@@ -272,7 +280,7 @@ async def _handle_new(
         await query.answer("Stale picker (topic mismatch)", show_alert=True)
         return
     clear_window_picker_state(context.user_data)
-    start_path = str(Path.cwd())
+    start_path = resolve_default_workdir()
     msg_text, keyboard, subdirs = build_directory_browser(start_path, user_id=user_id)
     if context.user_data is not None:
         context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY

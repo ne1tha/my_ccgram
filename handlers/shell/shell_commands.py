@@ -248,9 +248,12 @@ async def handle_shell_message(
         return
 
     if not completer:
-        # No LLM configured — raw mode is intentional
-        await _execute_raw_command(
-            client, user_id, thread_id, window_id, text, message_id=msg_id
+        await safe_send(
+            client,
+            chat_id,
+            "⚠ Shell command LLM is not configured — command not sent.\n"
+            "Use `! <command>` to run a raw shell command.",
+            message_thread_id=thread_id,
         )
         return
 

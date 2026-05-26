@@ -18,6 +18,7 @@ Module-level: _vim_state cache, _vim_locks for per-window send serialization.
 import asyncio
 import contextlib
 import fnmatch
+import os
 import re
 import shlex
 import structlog
@@ -49,6 +50,57 @@ _VIM_PROBE_DELAY = 0.12
 
 
 _VIM_INSERT_RE = re.compile(r"^--\s*INSERT\s*--\s*$")
+
+
+def _resolve_default_start_directory() -> str:
+    """Return a safe start directory for ccgram's tmux session/window shell."""
+    raw = getattr(config, "default_workdir", "") or str(Path.cwd())
+    try:
+        path = Path(raw).expanduser().resolve()
+    except OSError:
+        path = Path.cwd()
+    if path.is_dir():
+        return str(path)
+    try:
+        return str(Path.cwd().resolve())
+    except OSError:
+        return str(Path.home())
+
+
+def _is_codex_launch_command(launch_command: str) -> bool:
+    """Return True when a launch command starts the Codex CLI."""
+    try:
+        tokens = shlex.split(launch_command)
+    except ValueError:
+        tokens = launch_command.split()
+    if not tokens:
+        return False
+
+    idx = 0
+    if tokens[idx] in {"command", "exec"}:
+        idx += 1
+    if idx < len(tokens) and tokens[idx] == "env":
+        idx += 1
+        while idx < len(tokens):
+            token = tokens[idx]
+            if token in {"-i", "--ignore-environment"}:
+                idx += 1
+                continue
+            if token in {"-u", "--unset"} and idx + 1 < len(tokens):
+                idx += 2
+                continue
+            if token.startswith("-u") and len(token) > 2:
+                idx += 1
+                continue
+            if "=" in token and not token.startswith("/"):
+                idx += 1
+                continue
+            break
+    if idx >= len(tokens):
+        return False
+
+    basename = os.path.basename(tokens[idx])
+    return basename == "codex" or basename.startswith("codex-")
 
 
 def has_insert_indicator(pane_text: str) -> bool:
@@ -160,7 +212,7 @@ class TmuxManager:
         # Create new session with main window named specifically
         session = self.server.new_session(
             session_name=self.session_name,
-            start_directory=str(Path.home()),
+            start_directory=_resolve_default_start_directory(),
         )
         # Rename the default window to the main window name
         if session.windows:
@@ -1056,16 +1108,36 @@ class TmuxManager:
         return None
 
     @staticmethod
+    def _build_agent_launch_sequence(
+        launch_command: str,
+        agent_args: str,
+    ) -> list[str]:
+        """Build shell commands used to start an agent in a pane."""
+        commands: list[str] = []
+        # Keep the ccgram service proxy for Telegram connectivity, but do not
+        # pass it into agent CLIs. The user's normal Codex sessions run without
+        # these proxy variables, and api.idcfin.xyz is faster direct on this box.
+        if _is_codex_launch_command(launch_command):
+            commands.append(
+                "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy"
+            )
+        cmd = launch_command
+        if agent_args:
+            cmd = f"{cmd} {agent_args}"
+        commands.append(cmd)
+        return commands
+
+    @staticmethod
     def _start_agent_in_pane(
         pane: libtmux.Pane,
         launch_command: str,
         agent_args: str,
     ) -> None:
         """Send launch command to pane, appending agent_args if provided."""
-        cmd = launch_command
-        if agent_args:
-            cmd = f"{cmd} {agent_args}"
-        pane.send_keys(cmd, enter=True, literal=True)
+        for cmd in TmuxManager._build_agent_launch_sequence(
+            launch_command, agent_args
+        ):
+            pane.send_keys(cmd, enter=True, literal=True)
 
     async def create_window(
         self,

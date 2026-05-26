@@ -69,6 +69,21 @@ _PROJECT_MARKERS: dict[str, str] = {
 }
 
 
+def resolve_default_workdir() -> str:
+    """Return the default directory for new ccgram-created sessions."""
+    raw = getattr(config, "default_workdir", "") or str(Path.cwd())
+    try:
+        path = Path(raw).expanduser().resolve()
+    except OSError:
+        path = Path.cwd()
+    if path.is_dir():
+        return str(path)
+    try:
+        return str(Path.cwd().resolve())
+    except OSError:
+        return str(Path.home())
+
+
 def _detect_project_badge(parent: Path, name: str) -> str:
     """Return a project badge icon for a subdirectory, or empty string."""
     subdir = parent / name
@@ -224,7 +239,7 @@ def build_directory_browser(
 
     path = Path(current_path).expanduser().resolve()
     if not path.exists() or not path.is_dir():
-        path = Path.cwd()
+        path = Path(resolve_default_workdir())
 
     try:
         subdirs = sorted(

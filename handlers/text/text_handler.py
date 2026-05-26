@@ -30,6 +30,7 @@ from ..topics.directory_browser import (
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
     build_window_picker,
+    resolve_default_workdir,
     clear_browse_state,
     clear_window_picker_state,
 )
@@ -239,7 +240,7 @@ async def _handle_unbound_topic(
         user_id,
         thread_id,
     )
-    start_path = str(Path.cwd())
+    start_path = resolve_default_workdir()
     msg_text, keyboard, subdirs = build_directory_browser(start_path, user_id=user_id)
     if user_data is not None:
         user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
@@ -284,7 +285,7 @@ async def _handle_dead_window(
         )
         thread_router.unbind_thread(user_id, thread_id)
         lifecycle_strategy.clear_dead_notification(user_id, thread_id)
-        start_path = str(Path.cwd())
+        start_path = resolve_default_workdir()
         msg_text, keyboard, subdirs = build_directory_browser(
             start_path, user_id=user_id
         )
@@ -324,6 +325,42 @@ async def _handle_dead_window(
     banner_text, keyboard = render_banner(banner)
     await safe_reply(message, banner_text, reply_markup=keyboard)
     return True
+
+
+async def _get_effective_provider_name(window_id: str) -> str | None:
+    """Return the live provider for routing, correcting stale codex→shell state.
+
+    A ccgram-created Codex session intentionally drops back to the user's shell
+    when Codex exits.  The persisted window state can still say "codex" at that
+    moment, but forwarding ordinary chat text to a shell pane would execute it
+    as a raw command.  Detect that live shell state before routing.
+    """
+    stored_provider = window_query.get_window_provider(window_id)
+    w = await tmux_manager.find_window_by_id(window_id)
+    if not w or not w.pane_current_command:
+        return stored_provider
+
+    from ...providers import detect_provider_from_pane
+
+    live_provider = await detect_provider_from_pane(
+        w.pane_current_command,
+        pane_tty=w.pane_tty,
+        window_id=window_id,
+    )
+    if live_provider != "shell" or stored_provider == "shell":
+        return stored_provider
+
+    from ...session import session_manager
+
+    session_manager.set_window_provider(window_id, "shell", cwd=w.cwd or None)
+    logger.info(
+        "Live pane is shell; routing as shell instead of stored provider %r "
+        "(window=%s, command=%s)",
+        stored_provider,
+        window_id,
+        w.pane_current_command,
+    )
+    return "shell"
 
 
 async def _forward_message(
@@ -450,9 +487,8 @@ async def handle_text_message(
         return
 
     # Shell provider: route through LLM or raw execution
-    provider = get_provider_for_window(
-        window_id, provider_name=window_query.get_window_provider(window_id)
-    )
+    provider_name = await _get_effective_provider_name(window_id)
+    provider = get_provider_for_window(window_id, provider_name=provider_name)
     if not provider.capabilities.supports_mailbox_delivery:
         # Lazy: shell.shell_commands ↔ text_handler via approval callback.
         from ..shell.shell_commands import handle_shell_message
