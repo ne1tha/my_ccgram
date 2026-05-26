@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ....telegram_client import PTBTelegramClient
+from ....tmux_manager import tmux_manager
 from ...messaging_pipeline.message_queue import get_message_queue
 from ...recovery.transcript_discovery import discover_and_register_transcript
 from ..polling_state import (
@@ -68,12 +69,19 @@ async def tick_window(
     window: "TmuxWindow | None",
 ) -> None:
     """Run one poll cycle for one window."""
-    if lifecycle_strategy.is_dead_notified(user_id, thread_id, window_id):
-        return
-
-    if window is None:
-        await _handle_dead_window_notification(bot, user_id, thread_id, window_id)
-        return
+    dead_notified = lifecycle_strategy.is_dead_notified(user_id, thread_id, window_id)
+    if dead_notified or window is None:
+        fresh_window = window or await tmux_manager.find_window_by_id(window_id)
+        if fresh_window is not None:
+            window = fresh_window
+            if dead_notified:
+                lifecycle_strategy.clear_dead_notification(user_id, thread_id)
+                lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
+        elif dead_notified:
+            return
+        else:
+            await _handle_dead_window_notification(bot, user_id, thread_id, window_id)
+            return
 
     await discover_and_register_transcript(
         window_id,

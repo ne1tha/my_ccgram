@@ -338,6 +338,118 @@ class LaunchDefaultsTest(unittest.TestCase):
             self.assertEqual(event.transcript_path, str(actual))
 
 
+    def test_tick_window_rechecks_live_tmux_window_before_dead_notification(self):
+        import asyncio
+        import importlib
+        import types
+        from unittest.mock import AsyncMock, Mock, patch
+
+        window_tick = importlib.import_module("ccgram.handlers.polling.window_tick")
+        live_window = types.SimpleNamespace(
+            window_id="@11",
+            window_name="nvme-3",
+            cwd="/mnt/nvme",
+            pane_current_command="node",
+            pane_tty="/dev/pts/345",
+        )
+
+        async def run():
+            with (
+                patch.object(
+                    window_tick.lifecycle_strategy,
+                    "is_dead_notified",
+                    return_value=False,
+                ),
+                patch.object(window_tick, "PTBTelegramClient", return_value=object()),
+                patch(
+                    "ccgram.tmux_manager.tmux_manager.find_window_by_id",
+                    new=AsyncMock(return_value=live_window),
+                ) as find_mock,
+                patch.object(
+                    window_tick,
+                    "_handle_dead_window_notification",
+                    new=AsyncMock(),
+                ) as dead_mock,
+                patch.object(
+                    window_tick,
+                    "discover_and_register_transcript",
+                    new=AsyncMock(),
+                ) as discover_mock,
+                patch.object(window_tick, "get_message_queue", return_value=None),
+                patch.object(window_tick, "_update_status", new=AsyncMock()) as update_mock,
+                patch.object(window_tick, "_scan_window_panes", new=AsyncMock()),
+                patch.object(window_tick, "_maybe_check_passive_shell", new=AsyncMock()),
+            ):
+                await window_tick.tick_window(object(), 1, 295, "@11", None)
+                find_mock.assert_awaited_once_with("@11")
+                dead_mock.assert_not_awaited()
+                discover_mock.assert_awaited_once()
+                update_mock.assert_awaited_once()
+
+        asyncio.run(run())
+
+    def test_tick_window_clears_false_dead_notification_when_window_is_live(self):
+        import asyncio
+        import importlib
+        import types
+        from unittest.mock import AsyncMock, Mock, patch
+
+        window_tick = importlib.import_module("ccgram.handlers.polling.window_tick")
+        live_window = types.SimpleNamespace(
+            window_id="@11",
+            window_name="nvme-3",
+            cwd="/mnt/nvme",
+            pane_current_command="node",
+            pane_tty="/dev/pts/345",
+        )
+
+        async def run():
+            with (
+                patch.object(
+                    window_tick.lifecycle_strategy,
+                    "is_dead_notified",
+                    return_value=True,
+                ),
+                patch.object(
+                    window_tick.lifecycle_strategy,
+                    "clear_dead_notification",
+                    new=Mock(),
+                ) as clear_dead_mock,
+                patch.object(
+                    window_tick.lifecycle_strategy,
+                    "clear_autoclose_timer",
+                    new=Mock(),
+                ) as clear_timer_mock,
+                patch.object(window_tick, "PTBTelegramClient", return_value=object()),
+                patch(
+                    "ccgram.tmux_manager.tmux_manager.find_window_by_id",
+                    new=AsyncMock(return_value=live_window),
+                ),
+                patch.object(
+                    window_tick,
+                    "_handle_dead_window_notification",
+                    new=AsyncMock(),
+                ) as dead_mock,
+                patch.object(
+                    window_tick,
+                    "discover_and_register_transcript",
+                    new=AsyncMock(),
+                ) as discover_mock,
+                patch.object(window_tick, "get_message_queue", return_value=None),
+                patch.object(window_tick, "_update_status", new=AsyncMock()) as update_mock,
+                patch.object(window_tick, "_scan_window_panes", new=AsyncMock()),
+                patch.object(window_tick, "_maybe_check_passive_shell", new=AsyncMock()),
+            ):
+                await window_tick.tick_window(object(), 1, 295, "@11", None)
+                clear_dead_mock.assert_called_once_with(1, 295)
+                clear_timer_mock.assert_called_once_with(1, 295)
+                dead_mock.assert_not_awaited()
+                discover_mock.assert_awaited_once()
+                update_mock.assert_awaited_once()
+
+        asyncio.run(run())
+
+
     def test_live_transcript_discovery_uses_provider_age_default_not_zero(self):
         import asyncio
         import importlib
