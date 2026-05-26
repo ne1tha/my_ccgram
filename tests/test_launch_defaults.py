@@ -236,5 +236,111 @@ class LaunchDefaultsTest(unittest.TestCase):
         asyncio.run(run())
 
 
+    def test_codex_live_discovery_uses_pane_tty_open_fd_before_cwd_mtime(self):
+        import json
+        import os
+        from unittest.mock import patch
+
+        from ccgram.providers.codex import CodexProvider
+
+        def write_meta(path, session_id, cwd):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": session_id,
+                            "cwd": cwd,
+                            "originator": "codex-tui",
+                            "source": "cli",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            sessions = home / ".codex" / "sessions" / "2026" / "05" / "26"
+            actual = sessions / "rollout-actual.jsonl"
+            newer_wrong = sessions / "rollout-wrong.jsonl"
+            write_meta(actual, "actual-session", "/mnt/nvme")
+            write_meta(newer_wrong, "wrong-session", "/mnt/nvme")
+            os.utime(actual, (1000, 1000))
+            os.utime(newer_wrong, (2000, 2000))
+
+            proc = root / "proc"
+            live_pid = proc / "123"
+            (live_pid / "fd").mkdir(parents=True)
+            (live_pid / "cmdline").write_bytes(b"/usr/local/bin/codex\0--dangerously-bypass-approvals-and-sandbox\0")
+            os.symlink("/dev/pts/338", live_pid / "fd" / "0")
+            os.symlink(actual, live_pid / "fd" / "60")
+
+            other_pid = proc / "456"
+            (other_pid / "fd").mkdir(parents=True)
+            (other_pid / "cmdline").write_bytes(b"/usr/local/bin/codex\0resume\0wrong-session\0")
+            os.symlink("/dev/pts/999", other_pid / "fd" / "0")
+            os.symlink(newer_wrong, other_pid / "fd" / "60")
+
+            with patch("ccgram.providers.codex.Path.home", return_value=home):
+                event = CodexProvider().discover_transcript(
+                    "/mnt/nvme",
+                    "ccgram:@8",
+                    max_age=0,
+                    pane_tty="/dev/pts/338",
+                    proc_root=proc,
+                )
+
+            self.assertIsNotNone(event)
+            self.assertEqual(event.session_id, "actual-session")
+            self.assertEqual(event.transcript_path, str(actual))
+
+
+    def test_live_transcript_discovery_uses_provider_age_default_not_zero(self):
+        import asyncio
+        import importlib
+        import types
+        from unittest.mock import patch
+
+        transcript_discovery = importlib.import_module(
+            "ccgram.handlers.recovery.transcript_discovery"
+        )
+
+        class Provider:
+            capabilities = types.SimpleNamespace(name="codex")
+
+            def __init__(self):
+                self.max_age = "unset"
+
+            def discover_transcript(self, cwd, window_key, *, max_age=None, pane_tty=""):
+                self.max_age = max_age
+                return None
+
+        provider = Provider()
+        state = types.SimpleNamespace(cwd="/mnt/nvme", session_id="", transcript_path="", provider_name="codex")
+
+        async def run():
+            async def immediate(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with (
+                patch.object(transcript_discovery, "is_foreign_window", return_value=False),
+                patch.object(transcript_discovery.asyncio, "to_thread", new=immediate),
+            ):
+                await transcript_discovery._find_and_register_transcript(
+                    "@8",
+                    state,
+                    [("codex", provider)],
+                    True,
+                    pane_tty="/dev/pts/338",
+                )
+
+        asyncio.run(run())
+        self.assertIsNone(provider.max_age)
+
+
 if __name__ == "__main__":
     unittest.main()

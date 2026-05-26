@@ -14,6 +14,7 @@ Modern Codex ``response_item`` payloads use typed shapes:
 """
 
 import json
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -529,6 +530,98 @@ def _collect_codex_sessions(sessions_dir: Path) -> list[tuple[float, Path]]:
     return result
 
 
+def _normalize_tty_path(path: str) -> str:
+    """Normalize a tty symlink target for equality checks."""
+    return path.removesuffix(" (deleted)")
+
+
+def _cmdline_looks_like_codex(cmdline: bytes) -> bool:
+    """Return True when a /proc cmdline belongs to the Codex CLI."""
+    for raw in cmdline.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            part = raw.decode("utf-8", "ignore")
+        except UnicodeDecodeError:
+            continue
+        basename = Path(part).name
+        if basename == "codex" or basename.startswith("codex-"):
+            return True
+    return False
+
+
+def _collect_codex_sessions_for_tty(
+    sessions_dir: Path,
+    pane_tty: str,
+    *,
+    proc_root: Path | None = None,
+) -> list[tuple[float, Path]]:
+    """Collect JSONL transcripts opened by a Codex process on pane_tty.
+
+    Multiple Codex TUI processes can share the same cwd and keep old resumed
+    transcripts active. For a live ccgram tmux pane, cwd+mtime discovery is
+    therefore ambiguous. The controlling tty is the reliable boundary: the
+    transcript opened by the Codex process attached to this pane is the one that
+    belongs to this window.
+    """
+    if not pane_tty:
+        return []
+
+    root = proc_root or Path("/proc")
+    wanted_tty = _normalize_tty_path(pane_tty)
+    sessions_root = str(sessions_dir.resolve())
+    result: list[tuple[float, Path]] = []
+
+    try:
+        proc_entries = list(root.iterdir())
+    except OSError:
+        return []
+
+    for proc_dir in proc_entries:
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            cmdline = (proc_dir / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not _cmdline_looks_like_codex(cmdline):
+            continue
+
+        fd_dir = proc_dir / "fd"
+        try:
+            stdin_target = _normalize_tty_path(os.readlink(fd_dir / "0"))
+        except OSError:
+            continue
+        if stdin_target != wanted_tty:
+            continue
+
+        try:
+            fd_entries = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd_path in fd_entries:
+            try:
+                target = _normalize_tty_path(os.readlink(fd_path))
+            except OSError:
+                continue
+            if not target.endswith(".jsonl"):
+                continue
+            fpath = Path(target)
+            try:
+                resolved = str(fpath.resolve())
+            except OSError:
+                continue
+            if not resolved.startswith(sessions_root + "/"):
+                continue
+            try:
+                result.append((fpath.stat().st_mtime, fpath))
+            except OSError:
+                continue
+
+    result.sort(reverse=True)
+    return result
+
+
 def _read_codex_session_meta(fpath: Path) -> dict[str, Any] | None:
     """Read the session_meta payload from the first line of a Codex JSONL file."""
     try:
@@ -730,16 +823,26 @@ class CodexProvider(JsonlProvider):
         window_key: str,
         *,
         max_age: float | None = None,
+        pane_tty: str = "",
+        proc_root: Path | None = None,
     ) -> SessionStartEvent | None:
-        """Scan ~/.codex/sessions/ for the most recent transcript matching cwd.
+        """Scan ~/.codex/sessions/ for the transcript belonging to a window.
 
         Codex transcript path: ~/.codex/sessions/YYYY/MM/DD/<name>-<ts>-<uuid>.jsonl
         First line: {"type": "session_meta", "payload": {"id": "<uuid>", "cwd": "..."}}
 
+        For live tmux panes, ``pane_tty`` is preferred over cwd scanning. This
+        avoids binding a new topic to another active Codex process that shares
+        the same cwd and is still updating an older transcript.
+
         Args:
-            max_age: Maximum transcript age in seconds. ``None`` uses the
-                default ``_TRANSCRIPT_MAX_AGE_SECS`` (120s). Pass ``0`` or
-                negative to disable the age check entirely.
+            max_age: Maximum transcript age in seconds for cwd-scan fallback.
+                ``None`` uses the default ``_TRANSCRIPT_MAX_AGE_SECS`` (120s).
+                Pass ``0`` or negative to disable the fallback age check.
+            pane_tty: TTY of the live tmux pane, e.g. ``/dev/pts/338``. When
+                supplied, only transcripts opened by a Codex process attached
+                to this tty are accepted.
+            proc_root: Test seam for the Linux procfs root.
         """
         sessions_dir = Path.home() / ".codex" / "sessions"
         if not sessions_dir.is_dir():
@@ -749,12 +852,40 @@ class CodexProvider(JsonlProvider):
         import time
 
         age_limit = _TRANSCRIPT_MAX_AGE_SECS if max_age is None else max_age
-
-        jsonl_files = _collect_codex_sessions(sessions_dir)
         now = time.time()
         resolved_cwd = str(Path(cwd).resolve())
-        for mtime, fpath in jsonl_files[:20]:
-            if age_limit > 0 and now - mtime > age_limit:
+
+        if pane_tty:
+            jsonl_files = _collect_codex_sessions_for_tty(
+                sessions_dir, pane_tty, proc_root=proc_root
+            )
+            return self._discover_from_candidates(
+                jsonl_files,
+                resolved_cwd,
+                window_key,
+                age_limit=None,
+                now=now,
+            )
+
+        return self._discover_from_candidates(
+            _collect_codex_sessions(sessions_dir)[:20],
+            resolved_cwd,
+            window_key,
+            age_limit=age_limit,
+            now=now,
+        )
+
+    @staticmethod
+    def _discover_from_candidates(
+        jsonl_files: list[tuple[float, Path]],
+        resolved_cwd: str,
+        window_key: str,
+        *,
+        age_limit: float | None,
+        now: float,
+    ) -> SessionStartEvent | None:
+        for mtime, fpath in jsonl_files:
+            if age_limit is not None and age_limit > 0 and now - mtime > age_limit:
                 break  # sorted newest-first; remaining are all older
             meta = _read_codex_session_meta(fpath)
             if not meta:

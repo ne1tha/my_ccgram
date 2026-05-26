@@ -246,6 +246,7 @@ class AgentProvider(Protocol):
         window_key: str,
         *,
         max_age: float | None = None,
+        pane_tty: str = "",
     ) -> SessionStartEvent | None:
         """Discover transcript for a hookless provider session.
 
