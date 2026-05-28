@@ -195,13 +195,14 @@ class SessionMapSync:
     # Public: async read/sync methods
     # ------------------------------------------------------------------
 
-    async def load_session_map(self) -> None:
+    async def load_session_map(self, live_windows: list[Any] | None = None) -> None:
         """Read session_map.json and update window_states with new session associations.
 
         Keys in session_map are formatted as "tmux_session:window_id" (e.g. "ccgram:@12").
         Native entries (matching our tmux_session_name) and emdash entries (prefixed
         with "emdash-") are both processed. Emdash windows are marked as external.
-        Also cleans up window_states entries not in current session_map.
+        Also cleans up window_states entries not in current session_map unless the
+        tmux window is still live (e.g. just-created hookless providers).
         Updates window_display_names from the "window_name" field in values.
         """
         if not config.session_map_file.exists():
@@ -217,7 +218,9 @@ class SessionMapSync:
         valid_wids, old_format_sids, old_format_keys, changed = (
             self._process_session_map_entries(session_map, prefix)
         )
-        changed |= self._remove_stale_window_states(valid_wids, old_format_sids)
+        changed |= self._remove_stale_window_states(
+            valid_wids, old_format_sids, live_windows=live_windows
+        )
         self._purge_old_format_keys(session_map, old_format_keys)
 
         if changed:
@@ -281,9 +284,13 @@ class SessionMapSync:
         self,
         valid_wids: set[str],
         old_format_sids: set[str],
+        *,
+        live_windows: list[Any] | None = None,
     ) -> bool:
-        """Remove window_states not in valid_wids, not bound, and not old-format.
+        """Remove dead window_states not in valid_wids, not bound, and not old-format.
 
+        Live tmux windows are preserved even when they have no session_map entry,
+        because hookless providers may be created and bound before any hook writes.
         Returns True if any states were removed.
         """
         # Lazy: same session ↔ session_map ↔ stores cycle as
@@ -300,6 +307,7 @@ class SessionMapSync:
             for wid in user_bindings.values()
             if wid
         }
+        live_wids = {w.window_id for w in live_windows} if live_windows else set()
         stale_wids = [
             w
             for w in window_store.iter_window_ids()
@@ -307,6 +315,7 @@ class SessionMapSync:
                 w
                 and w not in valid_wids
                 and w not in bound_wids
+                and w not in live_wids
                 and window_store.get_session_id_for_window(w) not in old_format_sids
             )
         ]

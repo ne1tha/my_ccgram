@@ -12,6 +12,7 @@ import time
 from typing import TYPE_CHECKING
 
 import structlog
+import structlog.contextvars
 from telegram import Update
 from telegram.error import BadRequest, TelegramError
 from ... import window_query
@@ -93,15 +94,29 @@ async def _close_expired_topic(
                     )
     if removed:
         lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
+        killed = False
+        if window_id:
+            view = window_query.view_window(window_id)
+            if (
+                view
+                and view.origin == CCGRAM_CREATED_WINDOW_ORIGIN
+                and await tmux_manager.find_window_by_id(window_id)
+            ):
+                killed = await tmux_manager.kill_window(window_id)
         logger.info(
-            "auto_removed_topic", chat_id=chat_id, thread_id=thread_id, user_id=user_id
+            "auto_removed_topic",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            window_id=window_id,
+            window_action="killed" if killed else "kept",
         )
         await clear_topic_state(
             user_id,
             thread_id,
             client=client,
             window_id=window_id,
-            window_dead=True,
+            window_dead=killed,
         )
         thread_router.unbind_thread(user_id, thread_id)
 
@@ -184,47 +199,55 @@ async def prune_stale_state(live_windows: "list[TmuxWindow]") -> None:
 
 async def probe_topic_existence(client: TelegramClient) -> None:
     """Probe all bound topics via Telegram API; detect deleted topics."""
-    for user_id, thread_id, wid in list(thread_router.iter_thread_bindings()):
-        if lifecycle_strategy.should_skip_probe(wid):
-            continue
-        try:
-            await client.unpin_all_forum_topic_messages(
-                chat_id=thread_router.resolve_chat_id(user_id, thread_id),
-                message_thread_id=thread_id,
+    structlog.contextvars.clear_contextvars()
+    try:
+        for user_id, thread_id, wid in list(thread_router.iter_thread_bindings()):
+            if lifecycle_strategy.should_skip_probe(wid):
+                continue
+            structlog.contextvars.clear_contextvars()
+            structlog.contextvars.bind_contextvars(
+                user_id=user_id, thread_id=thread_id, window_id=wid
             )
-            terminal_poll_state.reset_probe_failures(wid)
-        except TelegramError as e:
-            if isinstance(e, BadRequest) and (
-                "Topic_id_invalid" in e.message
-                or "thread not found" in e.message.lower()
-            ):
-                w = await tmux_manager.find_window_by_id(wid)
-                view = window_query.view_window(wid)
-                killed = False
-                if w and view and view.origin == CCGRAM_CREATED_WINDOW_ORIGIN:
-                    await tmux_manager.kill_window(w.window_id)
-                    killed = True
-                terminal_poll_state.reset_probe_failures(wid)
-                await clear_topic_state(user_id, thread_id, client, window_id=wid)
-                thread_router.unbind_thread(user_id, thread_id)
-                action = "killed" if killed else "unbound"
-                logger.info(
-                    "Topic deleted: %s window_id '%s' and unbound thread %d for user %d",
-                    action,
-                    wid,
-                    thread_id,
-                    user_id,
+            try:
+                await client.unpin_all_forum_topic_messages(
+                    chat_id=thread_router.resolve_chat_id(user_id, thread_id),
+                    message_thread_id=thread_id,
                 )
-            else:
-                lifecycle_strategy.record_probe_failure(wid)
-                if not lifecycle_strategy.should_skip_probe(wid):
-                    log_throttled(
-                        logger,
-                        f"topic-probe:{wid}",
-                        "Topic probe error for %s: %s",
+                terminal_poll_state.reset_probe_failures(wid)
+            except TelegramError as e:
+                if isinstance(e, BadRequest) and (
+                    "Topic_id_invalid" in e.message
+                    or "thread not found" in e.message.lower()
+                ):
+                    w = await tmux_manager.find_window_by_id(wid)
+                    view = window_query.view_window(wid)
+                    killed = False
+                    if w and view and view.origin == CCGRAM_CREATED_WINDOW_ORIGIN:
+                        await tmux_manager.kill_window(w.window_id)
+                        killed = True
+                    terminal_poll_state.reset_probe_failures(wid)
+                    await clear_topic_state(user_id, thread_id, client, window_id=wid)
+                    thread_router.unbind_thread(user_id, thread_id)
+                    action = "killed" if killed else "unbound"
+                    logger.info(
+                        "Topic deleted: %s window_id '%s' and unbound thread %d for user %d",
+                        action,
                         wid,
-                        e,
+                        thread_id,
+                        user_id,
                     )
+                else:
+                    lifecycle_strategy.record_probe_failure(wid)
+                    if not lifecycle_strategy.should_skip_probe(wid):
+                        log_throttled(
+                            logger,
+                            f"topic-probe:{wid}",
+                            "Topic probe error for %s: %s",
+                            wid,
+                            e,
+                        )
+    finally:
+        structlog.contextvars.clear_contextvars()
 
 
 # ------------------------------------------------------------------

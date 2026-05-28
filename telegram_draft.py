@@ -68,6 +68,7 @@ __all__ = [
     "DraftStream",
     "is_draft_unavailable",
     "is_peer_draft_unsupported",
+    "pop_permanent_thread_failure",
     "mark_draft_unavailable",
     "mark_peer_draft_unsupported",
     "reset_draft_state",
@@ -102,6 +103,14 @@ _PEER_INVALID_MARKERS: Final[tuple[str, ...]] = (
     "chat not found",
 )
 
+# Permanent topic errors: retrying or falling back to legacy send_message will
+# hit the same missing thread and create an infinite status/draft loop.
+_THREAD_NOT_FOUND_MARKERS: Final[tuple[str, ...]] = (
+    "message thread not found",
+    "thread not found",
+    "topic_id_invalid",
+)
+
 
 # Process-wide flag — once any caller observes the draft API as unavailable,
 # all subsequent DraftStream instances open in legacy mode without re-probing.
@@ -111,6 +120,7 @@ _DRAFT_REASON: str = ""
 # Per-peer cache of peers that have rejected drafts. Avoids retrying the
 # draft probe on every stream once a peer is known unsupported.
 _UNSUPPORTED_PEERS: set[tuple[int, int | None]] = set()
+_PERMANENT_THREAD_FAILURES: dict[tuple[int, int | None], str] = {}
 
 
 def is_draft_unavailable() -> bool:
@@ -141,6 +151,7 @@ def reset_draft_state() -> None:
     _DRAFT_UNAVAILABLE = False
     _DRAFT_REASON = ""
     _UNSUPPORTED_PEERS.clear()
+    _PERMANENT_THREAD_FAILURES.clear()
 
 
 def is_peer_draft_unsupported(chat_id: int, thread_id: int | None) -> bool:
@@ -157,6 +168,17 @@ def mark_peer_draft_unsupported(chat_id: int, thread_id: int | None) -> None:
     _UNSUPPORTED_PEERS.add((chat_id, thread_id))
 
 
+def pop_permanent_thread_failure(chat_id: int, thread_id: int | None) -> str | None:
+    """Return and clear a permanent missing-topic failure for a peer."""
+    return _PERMANENT_THREAD_FAILURES.pop((chat_id, thread_id), None)
+
+
+def _record_permanent_thread_failure(
+    chat_id: int, thread_id: int | None, exc: BadRequest
+) -> None:
+    _PERMANENT_THREAD_FAILURES[(chat_id, thread_id)] = str(exc)
+
+
 def _is_unsupported_error(exc: BadRequest) -> bool:
     msg = exc.message.lower() if exc.message else ""
     return any(m in msg for m in _UNSUPPORTED_MARKERS)
@@ -165,6 +187,11 @@ def _is_unsupported_error(exc: BadRequest) -> bool:
 def _is_peer_invalid_error(exc: BadRequest) -> bool:
     msg = exc.message.lower() if exc.message else ""
     return any(m in msg for m in _PEER_INVALID_MARKERS)
+
+
+def _is_thread_not_found_error(exc: BadRequest) -> bool:
+    msg = exc.message.lower() if exc.message else ""
+    return any(m in msg for m in _THREAD_NOT_FOUND_MARKERS)
 
 
 def _retry_after_seconds(exc: RetryAfter) -> float:
@@ -253,6 +280,18 @@ class DraftStream:
                 await self._start_legacy()
             else:
                 await self._start_streaming()
+        except BadRequest as exc:
+            if _is_thread_not_found_error(exc):
+                _record_permanent_thread_failure(self._chat_id, self._thread_id, exc)
+                logger.warning(
+                    "DraftStream.start permanent failure: %s chat=%s thread=%s",
+                    exc,
+                    self._chat_id,
+                    self._thread_id,
+                )
+                return None
+            logger.warning("DraftStream.start bad request: %s", exc)
+            return None
         except (TimedOut, NetworkError) as exc:
             logger.warning("DraftStream.start transient failure: %s", exc)
             return None
@@ -357,6 +396,8 @@ class DraftStream:
         try:
             result = await self._bot.do_api_request("sendMessageDraft", api_kwargs=data)
         except BadRequest as exc:
+            if _is_thread_not_found_error(exc):
+                raise
             if _is_unsupported_error(exc):
                 mark_draft_unavailable(f"sendMessageDraft: {exc.message}")
                 await self._start_legacy()

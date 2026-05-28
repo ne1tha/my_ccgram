@@ -450,6 +450,342 @@ class LaunchDefaultsTest(unittest.TestCase):
         asyncio.run(run())
 
 
+    def test_draft_stream_thread_not_found_is_not_transient(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        from telegram.error import BadRequest
+
+        from ccgram.telegram_draft import DraftStream
+
+        async def run():
+            bot = AsyncMock()
+            bot.do_api_request.side_effect = BadRequest("Message thread not found")
+
+            stream = DraftStream(bot, -100, message_thread_id=307)
+
+            with patch("ccgram.telegram_draft.logger.warning") as warn_mock:
+                msg_id = await stream.start("working")
+
+            self.assertIsNone(msg_id)
+            bot.do_api_request.assert_awaited_once()
+            bot.send_message.assert_not_awaited()
+            warning_text = "\n".join(str(call) for call in warn_mock.call_args_list)
+            self.assertIn("permanent failure", warning_text)
+            self.assertIn("thread=%s", warning_text)
+
+        asyncio.run(run())
+
+
+    def test_draft_stream_records_permanent_thread_failure(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from telegram.error import BadRequest
+
+        from ccgram.telegram_draft import (
+            DraftStream,
+            pop_permanent_thread_failure,
+        )
+
+        async def run():
+            bot = AsyncMock()
+            bot.do_api_request.side_effect = BadRequest("Message thread not found")
+
+            stream = DraftStream(bot, -100, message_thread_id=307)
+            msg_id = await stream.start("working")
+
+            self.assertIsNone(msg_id)
+            self.assertEqual(
+                pop_permanent_thread_failure(-100, 307), "Message thread not found"
+            )
+            self.assertIsNone(pop_permanent_thread_failure(-100, 307))
+
+        asyncio.run(run())
+
+
+    def test_session_map_prune_keeps_live_unbound_window_state_without_hook_entry(self):
+        from unittest.mock import Mock
+
+        from ccgram.session_map import SessionMapSync
+        from ccgram.thread_router import ThreadRouter, get_thread_router, install_thread_router
+        from ccgram.tmux_manager import TmuxWindow
+        from ccgram.window_state_store import (
+            CCGRAM_CREATED_WINDOW_ORIGIN,
+            WindowStateStore,
+            get_window_store,
+            install_window_store,
+        )
+
+        try:
+            previous_store = get_window_store()
+        except RuntimeError:
+            previous_store = None
+        try:
+            previous_router = get_thread_router()
+        except RuntimeError:
+            previous_router = None
+        store = WindowStateStore(
+            schedule_save=Mock(),
+            on_hookless_provider_switch=Mock(),
+        )
+        router = ThreadRouter(schedule_save=Mock(), has_window_state=Mock(return_value=True))
+        install_window_store(store)
+        install_thread_router(router)
+        try:
+            state = store.get_window_state("@11")
+            state.cwd = "/mnt/nvme"
+            state.provider_name = "codex"
+            state.origin = CCGRAM_CREATED_WINDOW_ORIGIN
+            live_windows = [TmuxWindow(window_id="@11", window_name="nvme-3", cwd="/mnt/nvme")]
+
+            removed = SessionMapSync(schedule_save=Mock())._remove_stale_window_states(
+                valid_wids=set(),
+                old_format_sids=set(),
+                live_windows=live_windows,
+            )
+
+            self.assertFalse(removed)
+            self.assertTrue(store.has_window("@11"))
+            self.assertEqual(store.get_window_state("@11").origin, CCGRAM_CREATED_WINDOW_ORIGIN)
+        finally:
+            if previous_store is not None:
+                install_window_store(previous_store)
+            if previous_router is not None:
+                install_thread_router(previous_router)
+
+
+    def test_session_map_sync_preserves_origin_when_codex_hook_arrives(self):
+        from unittest.mock import Mock
+
+        from ccgram.session_map import SessionMapSync
+        from ccgram.thread_router import ThreadRouter, get_thread_router, install_thread_router
+        from ccgram.window_state_store import (
+            CCGRAM_CREATED_WINDOW_ORIGIN,
+            WindowStateStore,
+            get_window_store,
+            install_window_store,
+        )
+
+        try:
+            previous_store = get_window_store()
+        except RuntimeError:
+            previous_store = None
+        try:
+            previous_router = get_thread_router()
+        except RuntimeError:
+            previous_router = None
+        store = WindowStateStore(
+            schedule_save=Mock(),
+            on_hookless_provider_switch=Mock(),
+        )
+        install_window_store(store)
+        router = ThreadRouter(schedule_save=Mock(), has_window_state=Mock(return_value=True))
+        install_thread_router(router)
+        try:
+            state = store.get_window_state("@11")
+            state.origin = CCGRAM_CREATED_WINDOW_ORIGIN
+            sync = SessionMapSync(schedule_save=Mock())
+
+            changed = sync._sync_window_from_session_map(
+                "@11",
+                {
+                    "session_id": "sid-11",
+                    "cwd": "/mnt/nvme",
+                    "window_name": "nvme-3",
+                    "transcript_path": "/tmp/transcript.jsonl",
+                    "provider_name": "codex",
+                },
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(store.get_window_state("@11").origin, CCGRAM_CREATED_WINDOW_ORIGIN)
+        finally:
+            if previous_store is not None:
+                install_window_store(previous_store)
+            if previous_router is not None:
+                install_thread_router(previous_router)
+
+
+    def test_autoclose_kills_ccgram_created_window_to_prevent_recreated_topic(self):
+        import asyncio
+        import importlib
+        import types
+        from unittest.mock import AsyncMock, Mock, patch
+
+        topic_lifecycle = importlib.import_module("ccgram.handlers.topics.topic_lifecycle")
+        thread_router_mod = importlib.import_module("ccgram.thread_router")
+
+        async def run():
+            router = thread_router_mod.ThreadRouter(
+                schedule_save=Mock(),
+                has_window_state=Mock(return_value=True),
+            )
+            router.bind_thread(1, 295, "@11")
+            router.set_group_chat_id(1, 295, -100)
+            thread_router_mod.install_thread_router(router)
+            client = AsyncMock()
+            window_view = types.SimpleNamespace(origin="ccgram_created")
+
+            with (
+                patch("ccgram.window_query.view_window", return_value=window_view),
+                patch(
+                    "ccgram.tmux_manager.tmux_manager.find_window_by_id",
+                    new=AsyncMock(return_value=object()),
+                ),
+                patch(
+                    "ccgram.tmux_manager.tmux_manager.kill_window",
+                    new=AsyncMock(return_value=True),
+                ) as kill_mock,
+                patch.object(
+                    topic_lifecycle,
+                    "clear_topic_state",
+                    new=AsyncMock(),
+                ) as clear_mock,
+            ):
+                await topic_lifecycle._close_expired_topic(client, 1, 295)
+
+            client.delete_forum_topic.assert_awaited_once_with(
+                chat_id=-100,
+                message_thread_id=295,
+            )
+            kill_mock.assert_awaited_once_with("@11")
+            clear_mock.assert_awaited_once()
+            self.assertTrue(clear_mock.await_args.kwargs["window_dead"])
+            self.assertIsNone(router.get_window_for_thread(1, 295))
+
+        asyncio.run(run())
+
+
+    def test_status_thread_not_found_kills_ccgram_created_window(self):
+        import asyncio
+        import importlib
+        import types
+        from unittest.mock import AsyncMock, Mock, patch
+
+        status_bubble = importlib.import_module(
+            "ccgram.handlers.status.status_bubble"
+        )
+        message_queue = importlib.import_module(
+            "ccgram.handlers.messaging_pipeline.message_queue"
+        )
+        thread_router_mod = importlib.import_module("ccgram.thread_router")
+
+        async def run():
+            client = object()
+            router = thread_router_mod.ThreadRouter(
+                schedule_save=Mock(),
+                has_window_state=Mock(return_value=True),
+            )
+            router.bind_thread(1, 307, "@11")
+            router.set_group_chat_id(1, 307, -100)
+            thread_router_mod.install_thread_router(router)
+            window_view = types.SimpleNamespace(origin="ccgram_created")
+
+            with (
+                patch.object(status_bubble, "_rc_active_fn", lambda _window_id: False),
+                patch.object(
+                    status_bubble, "_start_bubble", new=AsyncMock(return_value=None)
+                ),
+                patch.object(
+                    message_queue,
+                    "pop_permanent_thread_failure",
+                    Mock(return_value="Message thread not found"),
+                ),
+                patch("ccgram.window_query.view_window", return_value=window_view),
+                patch(
+                    "ccgram.tmux_manager.tmux_manager.find_window_by_id",
+                    new=AsyncMock(return_value=object()),
+                ),
+                patch(
+                    "ccgram.handlers.cleanup.clear_topic_state",
+                    new=AsyncMock(),
+                ) as clear_mock,
+                patch(
+                    "ccgram.tmux_manager.tmux_manager.kill_window",
+                    new=AsyncMock(return_value=True),
+                ) as kill_mock,
+            ):
+                task = message_queue.StatusUpdateTask("@11", "working", thread_id=307)
+                await message_queue._dispatch(
+                    client, 1, task, asyncio.Queue(), asyncio.Lock()
+                )
+
+            self.assertIsNone(router.get_window_for_thread(1, 307))
+            self.assertEqual(router.get_thread_for_window(1, "@11"), None)
+            clear_mock.assert_awaited_once()
+            self.assertIsNone(clear_mock.await_args.kwargs["client"])
+            self.assertEqual(clear_mock.await_args.kwargs["window_id"], "@11")
+            self.assertTrue(clear_mock.await_args.kwargs["window_dead"])
+            kill_mock.assert_awaited_once_with("@11")
+
+        asyncio.run(run())
+
+    def test_status_thread_not_found_keeps_manual_window(self):
+        import asyncio
+        import importlib
+        import types
+        from unittest.mock import AsyncMock, Mock, patch
+
+        status_bubble = importlib.import_module(
+            "ccgram.handlers.status.status_bubble"
+        )
+        message_queue = importlib.import_module(
+            "ccgram.handlers.messaging_pipeline.message_queue"
+        )
+        thread_router_mod = importlib.import_module("ccgram.thread_router")
+
+        async def run():
+            client = object()
+            router = thread_router_mod.ThreadRouter(
+                schedule_save=Mock(),
+                has_window_state=Mock(return_value=True),
+            )
+            router.bind_thread(1, 307, "@11")
+            router.set_group_chat_id(1, 307, -100)
+            thread_router_mod.install_thread_router(router)
+            window_view = types.SimpleNamespace(origin="manual_discovered")
+
+            with (
+                patch.object(status_bubble, "_rc_active_fn", lambda _window_id: False),
+                patch.object(
+                    status_bubble, "_start_bubble", new=AsyncMock(return_value=None)
+                ),
+                patch.object(
+                    message_queue,
+                    "pop_permanent_thread_failure",
+                    Mock(return_value="Message thread not found"),
+                ),
+                patch("ccgram.window_query.view_window", return_value=window_view),
+                patch(
+                    "ccgram.tmux_manager.tmux_manager.find_window_by_id",
+                    new=AsyncMock(return_value=object()),
+                ),
+                patch(
+                    "ccgram.handlers.cleanup.clear_topic_state",
+                    new=AsyncMock(),
+                ) as clear_mock,
+                patch(
+                    "ccgram.tmux_manager.tmux_manager.kill_window",
+                    new=AsyncMock(return_value=True),
+                ) as kill_mock,
+            ):
+                task = message_queue.StatusUpdateTask("@11", "working", thread_id=307)
+                await message_queue._dispatch(
+                    client, 1, task, asyncio.Queue(), asyncio.Lock()
+                )
+
+            self.assertIsNone(router.get_window_for_thread(1, 307))
+            self.assertEqual(router.get_thread_for_window(1, "@11"), None)
+            clear_mock.assert_awaited_once()
+            self.assertIsNone(clear_mock.await_args.kwargs["client"])
+            self.assertEqual(clear_mock.await_args.kwargs["window_id"], "@11")
+            self.assertFalse(clear_mock.await_args.kwargs["window_dead"])
+            kill_mock.assert_not_awaited()
+
+        asyncio.run(run())
+
+
     def test_live_transcript_discovery_uses_provider_age_default_not_zero(self):
         import asyncio
         import importlib

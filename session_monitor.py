@@ -336,13 +336,13 @@ class SessionMonitor:
         while self._running:
             try:
                 await self._read_hook_events()
-                await session_map_sync.load_session_map()
-
-                current_map = await self._detect_and_cleanup_changes()
-
                 all_windows = await tmux_manager.list_windows()
                 external_windows = await tmux_manager.discover_external_sessions()
                 all_windows = all_windows + external_windows
+                await session_map_sync.load_session_map(all_windows)
+
+                current_map = await self._detect_and_cleanup_changes()
+
                 live_window_ids = {w.window_id for w in all_windows}
                 session_map_sync.prune_session_map(live_window_ids)
                 known_window_ids = set(current_map.keys())

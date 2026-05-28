@@ -16,10 +16,14 @@ from telegram.error import RetryAfter, TelegramError
 
 from ...config import config
 from ...telegram_client import TelegramClient
+from ...telegram_draft import pop_permanent_thread_failure
+from ...window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
 from ...thread_router import thread_router
 from ...topic_state_registry import topic_state
+from ...tmux_manager import tmux_manager
 from ...utils import task_done_callback
 from ...tts import TtsSynthesisError, get_synthesizer, prepare_tts_text
+from ... import window_query
 from ...window_query import is_tool_calls_hidden
 from ..status.status_bubble import (
     clear_status_message,
@@ -320,6 +324,50 @@ async def _flush_batch_for_task(
         await flush_batch(client, user_id, tkey)
 
 
+
+async def _cleanup_permanent_thread_failure(
+    client: TelegramClient,
+    user_id: int,
+    task: StatusUpdateTask | StatusClearTask,
+    reason: str,
+) -> None:
+    """Clean up a Telegram topic that is permanently gone."""
+    if task.thread_id is None:
+        return
+    window_id = thread_router.get_window_for_thread(user_id, task.thread_id)
+    if window_id is None:
+        return
+    if task.window_id and window_id != task.window_id:
+        return
+
+    view = window_query.view_window(window_id)
+    should_kill = bool(view and view.origin == CCGRAM_CREATED_WINDOW_ORIGIN)
+    killed = False
+    if should_kill and await tmux_manager.find_window_by_id(window_id):
+        killed = await tmux_manager.kill_window(window_id)
+
+    # Lazy: cleanup imports this module for enqueue_status_update.
+    from ..cleanup import clear_topic_state
+
+    await clear_topic_state(
+        user_id,
+        task.thread_id,
+        client=None,
+        window_id=window_id,
+        window_dead=killed,
+    )
+    thread_router.unbind_thread(user_id, task.thread_id)
+    action = "killed" if killed else "unbound"
+    logger.info(
+        "Topic missing during status update: %s thread %s from window %s for user %s: %s",
+        action,
+        task.thread_id,
+        window_id,
+        user_id,
+        reason,
+    )
+
+
 async def _dispatch(
     client: TelegramClient,
     user_id: int,
@@ -338,10 +386,20 @@ async def _dispatch(
                 for _ in range(dropped):
                     queue.task_done()
             await process_status_update(client, user_id, collapsed_task)
+            chat_id = thread_router.resolve_chat_id(user_id, collapsed_task.thread_id)
+            reason = pop_permanent_thread_failure(chat_id, collapsed_task.thread_id)
+            if reason is not None:
+                await _cleanup_permanent_thread_failure(
+                    client, user_id, collapsed_task, reason
+                )
             return 0
         case StatusClearTask() as cl:
             await _flush_batch_for_task(user_id, cl, client)
             await process_status_clear(client, user_id, cl)
+            chat_id = thread_router.resolve_chat_id(user_id, cl.thread_id)
+            reason = pop_permanent_thread_failure(chat_id, cl.thread_id)
+            if reason is not None:
+                await _cleanup_permanent_thread_failure(client, user_id, cl, reason)
             return 0
         case _ as unreachable:
             assert_never(unreachable)
@@ -351,12 +409,20 @@ async def _message_queue_worker(client: TelegramClient, user_id: int) -> None:
     """Process message tasks for a user sequentially."""
     queue = _message_queues[user_id]
     lock = _queue_locks[user_id]
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(user_id=user_id)
     logger.debug("Message queue worker started for user %s", user_id)
 
     while True:
         try:
             task = await queue.get()
             try:
+                structlog.contextvars.clear_contextvars()
+                structlog.contextvars.bind_contextvars(
+                    user_id=user_id,
+                    window_id=getattr(task, "window_id", None),
+                    thread_id=getattr(task, "thread_id", None),
+                )
                 while True:
                     try:
                         extra = await _dispatch(client, user_id, task, queue, lock)
@@ -385,6 +451,7 @@ async def _message_queue_worker(client: TelegramClient, user_id: int) -> None:
                     getattr(task, "thread_id", None),
                 )
             finally:
+                structlog.contextvars.clear_contextvars()
                 queue.task_done()
         except asyncio.CancelledError:
             logger.debug("Message queue worker cancelled for user %s", user_id)
